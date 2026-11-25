@@ -1,192 +1,229 @@
-// Steady Trend Rider — a tiny trend bot for "Tiny Bot, Easy $2: Beat Buy-and-Hold on Solana".
+// Steady Trend Rider II — a tiny trend bot for "Tiny Bot, Easy $2: Beat Buy-and-Hold on Solana".
 //
-// The idea, in one paragraph: the dev window (and the final window it stands in for) is a
-// basket of seven Solana assets that mostly drift down with sharp up-legs. Buy-and-hold eats
-// every down-leg. This bot does the opposite: it sits in USDC by default, enters only when a
-// symbol shows a real trend, and exits fast when the trend breaks. Three rules do all the work:
+// v2 rebuilds the v1 "Steady Trend Rider" around the house ema-cross baseline's insight and
+// two measured fixes. The house baseline (EMA 8/21, plain cross in/out) scores -173.04 on the
+// dev window while our v1 (EMA 5/13 + 24h gate + trailing stop) scored -251.26: the slower
+// pair whipsaws far less in a drifting-down market, and the gate alone was not enough. v2
+// therefore runs the house pair as its main trend, keeps a looser 24h gate (enter unless the
+// symbol is down more than 2% on the day), and exits a leg the moment its fast EMA ticks down
+// a single bar instead of waiting for the slow cross back — in this market the cross-down
+// exit gives back most of the leg. Two smaller additions: a fast 5/13 "leg" overlay that
+// re-enters inside an already-positive slow trend when the day is up at least 1% (it buys
+// trade count, which the 8/21 pair alone leaves at exactly 8 per 68-bar window), and
+// tenth-of-equity stakes instead of sevenths, so one bad name costs less of the book.
 //
-//   1. Entry on an EMA(5) cross above EMA(13), gated by a 24-bar (one-day) return at or
-//      above 0%, so the bot only buys a trend that is not already down on the day — never a
-//      one-bar wiggle, never a falling knife.
-//   2. Exit on EMA(5) crossing back below EMA(13), or a 6% trailing stop from the peak close
-//      since entry, or a 10% hard stop under cost — whichever comes first.
-//   3. At most 7 concurrent positions (the whole universe), each about a seventh of equity
-//      (under the 25% weight cap), so one bad name can never sink the book and a failed
-//      market-wide bounce costs a seventh per name, not a fifth.
+//   Main trend: EMA(8) above EMA(21), enterable for 3 bars after the cross, gated by the
+//     24-bar return being at or above -2%.
+//   Leg overlay: EMA(5) crossing above EMA(13) while the main trend is already positive
+//     and the 24-bar return is at or above +1%.
+//   Exit: main trend crosses back down, or the fast EMA falls for one bar, or a 6%
+//     trailing stop from the peak close since entry, or a 10% hard stop under cost.
+//   Sizing: equity / 10 per new position (under the 25% weight cap), sells first, then
+//     buys; max slippage 100 bps.
 //
-// The lessons from the earlier trading races are built in: a hard position cap instead of
-// chop-trading (the bot waits for the one real move per symbol), a regime gate (the 24h return
-// filter) so it does not buy noise, a max-drawdown discipline (trailing + hard stop), and
-// validation on more than one window of the kit's data before anything is submitted.
-//
-// Deterministic by construction: float64 EMAs only, no clock, no environment, no randomness,
-// so the two grading runs produce byte-identical action logs.
+// Deterministic by construction: float64 EMAs only, no clock, no environment, no
+// randomness, so the two grading runs produce byte-identical action logs.
 
 import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-// --- Parameters (chosen from principle, checked on two windows — see HANDOFF.md) ---
-const FAST_BARS = 5; // fast EMA span, in bars — short enough to catch hourly turns
-const SLOW_BARS = 13; // slow EMA span, in bars
-const TREND_BARS = 24; // regime gate: return over the last 24 bars (one day)
-const ENTER_MIN_24H = 0.0; // enter only if the symbol is not down over the last day
-const CROSS_FRESH_BARS = 3; // a cross stays enterable this many bars (retries a refused buy)
-const TRAIL_PCT = 0.06; // trailing stop: exit 6% below the peak close since entry
-const HARD_STOP_PCT = 0.1; // hard stop: exit at 10% under cost
-const MAX_POSITIONS = 7; // at most this many symbols held at once (the whole universe)
-const MAX_SLIPPAGE_BPS = 100; // 1% past the close the order was decided on
+// --- Tuned configuration (swept on the dev window + both 68-bar halves — see HANDOFF-v2.md) ---
+const CONFIG = {
+  fastSpan: 8, // main trend: fast EMA span, in bars
+  slowSpan: 21, // main trend: slow EMA span, in bars
+  legFastSpan: 5, // leg overlay: fast EMA span, in bars
+  legSlowSpan: 13, // leg overlay: slow EMA span, in bars
+  gateBars: 24, // regime gate: return over the last 24 bars (one day)
+  minDayReturn: -0.02, // main entries: skip a symbol down more than 2% on the day
+  legMinDayReturn: 0.01, // leg entries: only when the symbol is up at least 1% on the day
+  crossFreshBars: 3, // a main-trend cross stays enterable this many bars (retries a refused buy)
+  trailPct: 0.06, // trailing stop: exit 6% below the peak close since entry
+  hardStopPct: 0.1, // hard stop: exit at 10% under cost
+  slots: 10, // stake denominator: each new position is about a tenth of equity
+  maxSlippageBps: 100, // 1% past the close the order was decided on
+} as const;
 
-// --- Per-symbol indicator state ---------------------------------------------
-interface Ema {
-  span: number;
-  warm: number[];
-  value: number | null;
+// --- One EMA: the closes it has seen until it starts, then its value. ----------------
+class Ema {
+  private readonly alpha: number;
+  private readonly warm: number[] = [];
+  private current: number | null = null;
+  private previous: number | null = null;
+  readonly span: number;
+
+  constructor(span: number) {
+    this.span = span;
+    this.alpha = 2 / (span + 1);
+  }
+
+  push(close: number): void {
+    this.previous = this.current;
+    if (this.current !== null) {
+      this.current += this.alpha * (close - this.current);
+      return;
+    }
+    this.warm.push(close);
+    if (this.warm.length === this.span) {
+      this.current = this.warm.reduce((a, x) => a + x, 0) / this.span;
+    }
+  }
+
+  get value(): number | null {
+    return this.current;
+  }
+
+  /** True when this bar's step moved the EMA down — the leg is stalling. */
+  get fell(): boolean {
+    return this.current !== null && this.previous !== null && this.current < this.previous;
+  }
 }
 
-interface Series {
-  fast: Ema;
-  slow: Ema;
-  /** fast - slow after the previous bar, once both EMAs are seeded. */
-  gapPrev: number | null;
-  /** fast - slow after this bar. */
-  gap: number | null;
-  /** Seq of the last bar where fast sat at or below slow (the cross is fresh after it). */
-  lastDownSeq: number;
-  /** Closes, oldest first, capped at TREND_BARS + 1. */
-  closes: number[];
+// --- Per-symbol state: two EMA pairs, a close ring, and the exit bookkeeping. --------
+class SymbolBook {
+  readonly trendFast = new Ema(CONFIG.fastSpan);
+  readonly trendSlow = new Ema(CONFIG.slowSpan);
+  readonly legFast = new Ema(CONFIG.legFastSpan);
+  readonly legSlow = new Ema(CONFIG.legSlowSpan);
+  /** Seq of the last bar where the main fast EMA sat at or below the slow one. */
+  private lastDownSeq = -1;
   /** Highest close seen while a position is held; null when flat. */
-  peak: number | null;
-}
+  peak: number | null = null;
+  private gap = { prev: null as number | null, now: null as number | null };
+  private legGap = { prev: null as number | null, now: null as number | null };
+  /** Closes, oldest first, capped at gateBars + 1. */
+  private readonly closes: number[] = [];
 
-const series = new Map<string, Series>();
-
-function newSeries(): Series {
-  return {
-    fast: { span: FAST_BARS, warm: [], value: null },
-    slow: { span: SLOW_BARS, warm: [], value: null },
-    gapPrev: null,
-    gap: null,
-    lastDownSeq: -1,
-    closes: [],
-    peak: null,
-  };
-}
-
-function stepEma(e: Ema, close: number): void {
-  if (e.value !== null) {
-    e.value += (2 / (e.span + 1)) * (close - e.value);
-    return;
+  ingest(bar: Bar, seq: number): void {
+    const close = Number(bar.c);
+    this.trendFast.push(close);
+    this.trendSlow.push(close);
+    this.legFast.push(close);
+    this.legSlow.push(close);
+    this.gap.prev = this.gap.now;
+    this.gap.now = this.trendFast.value !== null && this.trendSlow.value !== null ? this.trendFast.value - this.trendSlow.value : null;
+    this.legGap.prev = this.legGap.now;
+    this.legGap.now = this.legFast.value !== null && this.legSlow.value !== null ? this.legFast.value - this.legSlow.value : null;
+    if (this.gap.now !== null && this.gap.now <= 0) this.lastDownSeq = seq;
+    this.closes.push(close);
+    if (this.closes.length > CONFIG.gateBars + 1) this.closes.shift();
   }
-  e.warm.push(close);
-  if (e.warm.length === e.span) e.value = e.warm.reduce((a, x) => a + x, 0) / e.span;
-}
 
-/** Fold one bar into its symbol's indicators. Never throws on a gap: a missing bar adds nothing. */
-function pushBar(bar: Bar, seq: number): Series {
-  let s = series.get(bar.symbol);
-  if (s === undefined) {
-    s = newSeries();
-    series.set(bar.symbol, s);
+  /** Main-trend gap (fast − slow) after this bar, or null before both EMAs seed. */
+  get trend(): number | null {
+    return this.gap.now;
   }
-  const close = Number(bar.c);
-  stepEma(s.fast, close);
-  stepEma(s.slow, close);
-  s.gapPrev = s.gap;
-  s.gap = s.fast.value !== null && s.slow.value !== null ? s.fast.value - s.slow.value : null;
-  if (s.gap !== null && s.gap <= 0) s.lastDownSeq = seq;
-  s.closes.push(close);
-  if (s.closes.length > TREND_BARS + 1) s.closes.shift();
-  return s;
+
+  /** The symbol's return over the last gateBars bars, or null before that history exists. */
+  get dayReturn(): number | null {
+    if (this.closes.length < CONFIG.gateBars + 1) return null;
+    const then = this.closes[0];
+    const now = this.closes[this.closes.length - 1];
+    return then === 0 ? null : now / then - 1;
+  }
+
+  /** Which entry signal, if any, is live on this bar: a fresh main cross, or a fresh leg. */
+  entrySignal(seq: number): 'trend' | 'leg' | null {
+    if (this.trend === null || this.trend <= 0) return null;
+    if (seq - this.lastDownSeq <= CONFIG.crossFreshBars) return 'trend';
+    const legCrossed = this.legGap.now !== null && this.legGap.now > 0 && this.legGap.prev !== null && this.legGap.prev <= 0;
+    const day = this.dayReturn;
+    if (legCrossed && day !== null && day >= CONFIG.legMinDayReturn) return 'leg';
+    return null;
+  }
+
+  /** Track the peak close while a position is held, for the trailing stop. */
+  noteHeldClose(state: BarsState, symbol: string): void {
+    const close = state.close(symbol);
+    if (close === null) return;
+    const c = Number(close);
+    if (this.peak === null || c > this.peak) this.peak = c;
+  }
+
+  /** Why a held position exits on this close, or null to keep holding. */
+  exitReason(state: BarsState, symbol: string, held: { qty: bigint; cost: bigint }): string | null {
+    if (this.trend !== null && this.trend < 0) return 'trend-broken';
+    if (this.trendFast.fell) return 'fast-rolling-over';
+    const close = state.close(symbol);
+    if (this.peak !== null && close !== null && Number(close) < this.peak * (1 - CONFIG.trailPct)) return 'trailing-stop';
+    const value = state.value(symbol, held.qty);
+    const stopAt = BigInt(Math.round((1 - CONFIG.hardStopPct) * 100));
+    if (value * 100n < held.cost * stopAt) return 'hard-stop';
+    return null;
+  }
 }
 
-/** The symbol's return over the last TREND_BARS bars, or null before that history exists. */
-function trendReturn(s: Series): number | null {
-  if (s.closes.length < TREND_BARS + 1) return null;
-  const then = s.closes[0];
-  const now = s.closes[s.closes.length - 1];
-  return then === 0 ? null : now / then - 1;
+const books = new Map<string, SymbolBook>();
+
+function bookFor(symbol: string): SymbolBook {
+  let book = books.get(symbol);
+  if (book === undefined) {
+    book = new SymbolBook();
+    books.set(symbol, book);
+  }
+  return book;
 }
 
-/** True when the symbol's trend cross is fresh enough to enter on (this bar or a recent retry). */
-function crossFresh(s: Series, seq: number): boolean {
-  return s.gap !== null && s.gap > 0 && seq - s.lastDownSeq <= CROSS_FRESH_BARS;
+// --- Order assembly: sells first, then buys sized off the remaining cash. -----------
+interface Scan {
+  sells: SellInput[];
+  entries: string[];
 }
 
-// --- Strategy ----------------------------------------------------------------
-
-/** Whether a held position exits on this close: trend broken, trailing stop, or hard stop. */
-function shouldExit(state: BarsState, symbol: string, held: { qty: bigint; cost: bigint }, s: Series): boolean {
-  // Trend broken: the fast EMA is back under the slow one (persistent, so a refused sell retries).
-  if (s.gap !== null && s.gap < 0) return true;
-  const close = state.close(symbol);
-  if (close === null) return false;
-  // Trailing stop: 6% below the peak close since entry.
-  if (s.peak !== null && Number(close) < s.peak * (1 - TRAIL_PCT)) return true;
-  // Hard stop: the position is worth HARD_STOP_PCT under what it cost.
-  const value = state.value(symbol, held.qty);
-  const stopAt = BigInt(Math.round((1 - HARD_STOP_PCT) * 100));
-  return value * 100n < held.cost * stopAt;
+/** Walk the symbols of one batch and decide sells and entries from their books. */
+function scanBatch(state: BarsState, batch: { seq: number }, fresh: Set<string>): Scan {
+  const sells: SellInput[] = [];
+  const entries: string[] = [];
+  for (const { symbol } of state.hello.symbols) {
+    if (!fresh.has(symbol)) continue;
+    const book = books.get(symbol)!;
+    const held = state.positions.get(symbol);
+    if (held !== undefined) {
+      book.noteHeldClose(state, symbol);
+      if (book.exitReason(state, symbol, held) !== null) {
+        sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: CONFIG.maxSlippageBps });
+      }
+    } else {
+      book.peak = null;
+      if (book.entrySignal(batch.seq) === null) continue;
+      const day = book.dayReturn;
+      if (day === null || day < CONFIG.minDayReturn) continue;
+      entries.push(symbol);
+    }
+  }
+  return { sells, entries };
 }
 
-/** Whether a symbol we do not hold is worth entering on this close. */
-function shouldEnter(state: BarsState, symbol: string, s: Series, seq: number): boolean {
-  if (state.positions.has(symbol)) return false;
-  if (!crossFresh(s, seq)) return false;
-  const ret = trendReturn(s);
-  if (ret === null || ret <= ENTER_MIN_24H) return false;
-  return true;
+/** Size the entries: equity split over CONFIG.slots, capped by the weight cap and cash. */
+function buildOrders(state: BarsState, scan: Scan): (SellInput | BuyInput)[] {
+  const { caps, fees } = state.hello;
+  const orders: (SellInput | BuyInput)[] = scan.sells.slice(0, caps.max_orders_per_bar);
+  // A sell's proceeds land at the next open and never fund this reply's buys.
+  const stake = state.equity / BigInt(CONFIG.slots);
+  const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
+  let room = CONFIG.slots - state.positions.size;
+  let cash = state.cash;
+  for (const symbol of scan.entries) {
+    if (room <= 0 || orders.length >= caps.max_orders_per_bar) break;
+    let slice = stake < byWeight ? stake : byWeight;
+    if (cash < slice) slice = cash;
+    if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) break;
+    orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: CONFIG.maxSlippageBps });
+    cash -= slice;
+    room--;
+  }
+  return orders;
 }
 
 await runBars({
   onBatch(state, batch) {
-    // Fold every bar of this batch into its symbol's indicators first, warm-up included:
+    // Fold every bar of this batch into its symbol's book first, warm-up included:
     // the warm-up bars seed the EMAs so the first tradable batch already has a trend read.
     const fresh = new Set<string>();
     for (const bar of batch.bars) {
-      pushBar(bar, batch.seq);
+      bookFor(bar.symbol).ingest(bar, batch.seq);
       fresh.add(bar.symbol);
     }
     // While warming up every order would be rejected: watch, do not trade.
     if (state.warmingUp) return [];
-
-    const { caps, fees } = state.hello;
-    const sells: SellInput[] = [];
-    const entries: string[] = [];
-
-    for (const { symbol } of state.hello.symbols) {
-      if (!fresh.has(symbol)) continue;
-      const s = series.get(symbol)!;
-      const held = state.positions.get(symbol);
-      if (held !== undefined) {
-        // Track the peak close while held, for the trailing stop.
-        const close = state.close(symbol);
-        if (close !== null) {
-          const c = Number(close);
-          if (s.peak === null || c > s.peak) s.peak = c;
-        }
-        if (shouldExit(state, symbol, held, s)) sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
-      } else {
-        s.peak = null;
-        if (shouldEnter(state, symbol, s, batch.seq)) entries.push(symbol);
-      }
-    }
-
-    const orders: (SellInput | BuyInput)[] = sells.slice(0, caps.max_orders_per_bar);
-    // Size: equity split over MAX_POSITIONS slots, capped by the weight cap and the cash left.
-    // A sell's proceeds land at the next open and never fund this reply's buys.
-    const stake = state.equity / BigInt(MAX_POSITIONS);
-    const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
-    let room = MAX_POSITIONS - state.positions.size;
-    let cash = state.cash;
-    for (const symbol of entries) {
-      if (room <= 0 || orders.length >= caps.max_orders_per_bar) break;
-      let slice = stake < byWeight ? stake : byWeight;
-      if (cash < slice) slice = cash;
-      if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) break;
-      orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS });
-      cash -= slice;
-      room--;
-    }
-    return orders;
+    return buildOrders(state, scanBatch(state, batch, fresh));
   },
 });
-
